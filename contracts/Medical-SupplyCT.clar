@@ -10,6 +10,10 @@
 (define-constant ERR-EXPIRED-PRODUCT (err u104))
 (define-constant ERR-INVALID-ROLE (err u105))
 (define-constant ERR-ALREADY-VERIFIED (err u106))
+(define-constant ERR-TEMP-TOO-LOW (err u107))
+(define-constant ERR-TEMP-TOO-HIGH (err u108))
+(define-constant ERR-TEMP-RANGE-NOT-SET (err u109))
+(define-constant ERR-INVALID-TEMP-RANGE (err u110))
 
 (define-constant ROLE-MANUFACTURER u1)
 (define-constant ROLE-DISTRIBUTOR u2)
@@ -19,6 +23,7 @@
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var product-id-nonce uint u0)
+(define-data-var temp-alert-counter uint u0)
 
 (define-map user-roles principal uint)
 
@@ -59,6 +64,30 @@
     verified-by: principal,
     verified-at: uint
   }
+)
+
+(define-map product-temp-thresholds
+  uint
+  {
+    min-temp: int,
+    max-temp: int
+  }
+)
+
+(define-map temp-alerts
+  uint
+  {
+    product-id: uint,
+    recorded-temp: int,
+    timestamp: uint,
+    reporter: principal,
+    violation-type: (string-ascii 16)
+  }
+)
+
+(define-map product-temp-compliance
+  uint
+  bool
 )
 
 (define-public (set-user-role (user principal) (role uint))
@@ -264,6 +293,83 @@
 
 (define-read-only (get-product-history-count (product-id uint))
   (default-to u0 (map-get? product-sequence-counter product-id))
+)
+
+(define-public (set-temp-threshold (product-id uint) (min-temp int) (max-temp int))
+  (let
+    ((product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+     (user-role (default-to u0 (map-get? user-roles tx-sender))))
+    
+    (asserts! (or
+      (is-eq tx-sender (var-get contract-owner))
+      (and (is-eq user-role ROLE-MANUFACTURER) (is-eq tx-sender (get manufacturer product)))
+      (is-eq user-role ROLE-REGULATOR)) ERR-NOT-AUTHORIZED)
+    (asserts! (<= min-temp max-temp) ERR-INVALID-TEMP-RANGE)
+    
+    (map-set product-temp-thresholds product-id {
+      min-temp: min-temp,
+      max-temp: max-temp
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (record-temperature (product-id uint) (temp int))
+  (let
+    ((product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+     (thresholds (unwrap! (map-get? product-temp-thresholds product-id) ERR-TEMP-RANGE-NOT-SET))
+     (user-role (default-to u0 (map-get? user-roles tx-sender)))
+     (min-temp (get min-temp thresholds))
+     (max-temp (get max-temp thresholds)))
+    
+    (asserts! (>= user-role ROLE-DISTRIBUTOR) ERR-NOT-AUTHORIZED)
+    
+    (if (and (>= temp min-temp) (<= temp max-temp))
+      (begin
+        (map-set product-temp-compliance product-id true)
+        (ok true)
+      )
+      (begin
+        (map-set product-temp-compliance product-id false)
+        (let
+          ((alert-id (+ (var-get temp-alert-counter) u1))
+           (violation-type (if (< temp min-temp) "LOW" "HIGH")))
+          
+          (map-set temp-alerts alert-id {
+            product-id: product-id,
+            recorded-temp: temp,
+            timestamp: stacks-block-height,
+            reporter: tx-sender,
+            violation-type: violation-type
+          })
+          
+          (var-set temp-alert-counter alert-id)
+          
+          (if (< temp min-temp)
+            ERR-TEMP-TOO-LOW
+            ERR-TEMP-TOO-HIGH
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-temp-threshold (product-id uint))
+  (map-get? product-temp-thresholds product-id)
+)
+
+(define-read-only (get-temp-alert (alert-id uint))
+  (map-get? temp-alerts alert-id)
+)
+
+(define-read-only (is-product-temp-compliant (product-id uint))
+  (default-to true (map-get? product-temp-compliance product-id))
+)
+
+(define-read-only (get-temp-alert-count)
+  (var-get temp-alert-counter)
 )
 
 (map-set user-roles (var-get contract-owner) ROLE-REGULATOR)
