@@ -24,6 +24,7 @@
 (define-data-var contract-owner principal tx-sender)
 (define-data-var product-id-nonce uint u0)
 (define-data-var temp-alert-counter uint u0)
+(define-data-var analytics-enabled bool true)
 
 (define-map user-roles principal uint)
 
@@ -90,6 +91,41 @@
   bool
 )
 
+(define-map supply-chain-metrics
+  { role: uint, period: uint }
+  {
+    total-transfers: uint,
+    avg-transit-time: uint,
+    temp-violations: uint,
+    products-handled: uint
+  }
+)
+
+(define-map global-analytics
+  (string-ascii 32)
+  uint
+)
+
+(define-map transit-performance
+  { from-role: uint, to-role: uint }
+  {
+    total-transfers: uint,
+    total-transit-time: uint,
+    fastest-transit: uint,
+    slowest-transit: uint
+  }
+)
+
+(define-map compliance-stats
+  uint
+  {
+    compliant-transfers: uint,
+    total-transfers: uint,
+    violation-count: uint,
+    last-updated: uint
+  }
+)
+
 (define-public (set-user-role (user principal) (role uint))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
@@ -141,6 +177,61 @@
   )
 )
 
+(define-private (update-analytics 
+  (product-id uint)
+  (from-role uint)
+  (to-role uint)
+  (transit-time uint)
+  (temp-compliant bool))
+  (begin
+    (if (var-get analytics-enabled)
+      (begin
+        (let
+          ((period (/ stacks-block-height u144))
+           (from-metrics (default-to { total-transfers: u0, avg-transit-time: u0, temp-violations: u0, products-handled: u0 }
+                           (map-get? supply-chain-metrics { role: from-role, period: period })))
+           (to-metrics (default-to { total-transfers: u0, avg-transit-time: u0, temp-violations: u0, products-handled: u0 }
+                         (map-get? supply-chain-metrics { role: to-role, period: period })))
+           (transit-key { from-role: from-role, to-role: to-role })
+           (transit-perf (default-to { total-transfers: u0, total-transit-time: u0, fastest-transit: u999999, slowest-transit: u0 }
+                           (map-get? transit-performance transit-key)))
+           (compliance (default-to { compliant-transfers: u0, total-transfers: u0, violation-count: u0, last-updated: u0 }
+                        (map-get? compliance-stats product-id))))
+          
+          (map-set supply-chain-metrics { role: from-role, period: period } {
+            total-transfers: (+ (get total-transfers from-metrics) u1),
+            avg-transit-time: (/ (+ (* (get avg-transit-time from-metrics) (get total-transfers from-metrics)) transit-time)
+                               (+ (get total-transfers from-metrics) u1)),
+            temp-violations: (+ (get temp-violations from-metrics) (if temp-compliant u0 u1)),
+            products-handled: (+ (get products-handled from-metrics) u1)
+          })
+          
+          (map-set transit-performance transit-key {
+            total-transfers: (+ (get total-transfers transit-perf) u1),
+            total-transit-time: (+ (get total-transit-time transit-perf) transit-time),
+            fastest-transit: (if (< transit-time (get fastest-transit transit-perf)) transit-time (get fastest-transit transit-perf)),
+            slowest-transit: (if (> transit-time (get slowest-transit transit-perf)) transit-time (get slowest-transit transit-perf))
+          })
+          
+          (map-set compliance-stats product-id {
+            compliant-transfers: (+ (get compliant-transfers compliance) (if temp-compliant u1 u0)),
+            total-transfers: (+ (get total-transfers compliance) u1),
+            violation-count: (+ (get violation-count compliance) (if temp-compliant u0 u1)),
+            last-updated: stacks-block-height
+          })
+          
+          (map-set global-analytics "total-transfers" 
+            (+ (default-to u0 (map-get? global-analytics "total-transfers")) u1))
+          (map-set global-analytics "temp-violations" 
+            (+ (default-to u0 (map-get? global-analytics "temp-violations")) (if temp-compliant u0 u1)))
+        )
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
 (define-public (transfer-product
   (product-id uint)
   (to principal)
@@ -175,7 +266,17 @@
     )
     
     (map-set product-sequence-counter product-id new-sequence)
-    (ok new-sequence)
+    
+    (let
+      ((last-transfer-time (match (map-get? product-history { product-id: product-id, sequence: current-sequence })
+          history (get timestamp history)
+          stacks-block-height))
+       (transit-time (- stacks-block-height last-transfer-time))
+       (temp-compliant (is-some temperature)))
+      
+      (unwrap-panic (update-analytics product-id user-role recipient-role transit-time temp-compliant))
+      (ok new-sequence)
+    )
   )
 )
 
@@ -370,6 +471,79 @@
 
 (define-read-only (get-temp-alert-count)
   (var-get temp-alert-counter)
+)
+
+(define-read-only (get-supply-chain-metrics (role uint) (period uint))
+  (map-get? supply-chain-metrics { role: role, period: period })
+)
+
+(define-read-only (get-transit-performance (from-role uint) (to-role uint))
+  (map-get? transit-performance { from-role: from-role, to-role: to-role })
+)
+
+(define-read-only (get-compliance-stats (product-id uint))
+  (map-get? compliance-stats product-id)
+)
+
+(define-read-only (get-global-analytics (metric (string-ascii 32)))
+  (default-to u0 (map-get? global-analytics metric))
+)
+
+(define-read-only (get-role-efficiency (role uint) (period uint))
+  (match (map-get? supply-chain-metrics { role: role, period: period })
+    metrics
+    (ok {
+      efficiency-score: (if (> (get total-transfers metrics) u0)
+        (/ (* (get products-handled metrics) u100) (get total-transfers metrics))
+        u0),
+      violation-rate: (if (> (get products-handled metrics) u0)
+        (/ (* (get temp-violations metrics) u100) (get products-handled metrics))
+        u0),
+      avg-transit-time: (get avg-transit-time metrics),
+      total-handled: (get products-handled metrics)
+    })
+    (ok { efficiency-score: u0, violation-rate: u0, avg-transit-time: u0, total-handled: u0 })
+  )
+)
+
+(define-read-only (get-supply-chain-health)
+  (let
+    ((total-transfers (get-global-analytics "total-transfers"))
+     (total-violations (get-global-analytics "temp-violations")))
+    (ok {
+      total-transfers: total-transfers,
+      total-violations: total-violations,
+      compliance-rate: (if (> total-transfers u0)
+        (/ (* (- total-transfers total-violations) u100) total-transfers)
+        u100),
+      violation-rate: (if (> total-transfers u0)
+        (/ (* total-violations u100) total-transfers)
+        u0)
+    })
+  )
+)
+
+(define-read-only (get-fastest-route (from-role uint) (to-role uint))
+  (match (map-get? transit-performance { from-role: from-role, to-role: to-role })
+    perf
+    (ok {
+      fastest-time: (get fastest-transit perf),
+      slowest-time: (get slowest-transit perf),
+      avg-time: (if (> (get total-transfers perf) u0)
+        (/ (get total-transit-time perf) (get total-transfers perf))
+        u0),
+      total-transfers: (get total-transfers perf)
+    })
+    (ok { fastest-time: u0, slowest-time: u0, avg-time: u0, total-transfers: u0 })
+  )
+)
+
+(define-public (toggle-analytics)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (var-set analytics-enabled (not (var-get analytics-enabled)))
+    (ok (var-get analytics-enabled))
+  )
 )
 
 (map-set user-roles (var-get contract-owner) ROLE-REGULATOR)
