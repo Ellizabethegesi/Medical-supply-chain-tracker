@@ -14,6 +14,7 @@
 (define-constant ERR-TEMP-TOO-HIGH (err u108))
 (define-constant ERR-TEMP-RANGE-NOT-SET (err u109))
 (define-constant ERR-INVALID-TEMP-RANGE (err u110))
+(define-constant ERR-PRODUCT-LOCKED (err u111))
 
 (define-constant ROLE-MANUFACTURER u1)
 (define-constant ROLE-DISTRIBUTOR u2)
@@ -87,6 +88,11 @@
 )
 
 (define-map product-temp-compliance
+  uint
+  bool
+)
+
+(define-map product-locked
   uint
   bool
 )
@@ -243,11 +249,13 @@
      (current-sequence (default-to u0 (map-get? product-sequence-counter product-id)))
      (new-sequence (+ current-sequence u1))
      (user-role (default-to u0 (map-get? user-roles tx-sender)))
-     (recipient-role (default-to u0 (map-get? user-roles to))))
+     (recipient-role (default-to u0 (map-get? user-roles to)))
+     (locked (default-to false (map-get? product-locked product-id))))
     
     (asserts! (is-eq tx-sender (get current-owner product)) ERR-INVALID-OWNER)
     (asserts! (>= user-role ROLE-MANUFACTURER) ERR-NOT-AUTHORIZED)
     (asserts! (>= recipient-role ROLE-MANUFACTURER) ERR-NOT-AUTHORIZED)
+    (asserts! (not locked) ERR-PRODUCT-LOCKED)
     (asserts! (< stacks-block-height (get expiry-date product)) ERR-EXPIRED-PRODUCT)
     
     (map-set products product-id 
@@ -353,6 +361,36 @@
   )
 )
 
+(define-public (lock-product (product-id uint))
+  (let
+    ((product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+     (user-role (default-to u0 (map-get? user-roles tx-sender))))
+    (asserts! (or
+      (is-eq tx-sender (var-get contract-owner))
+      (is-eq user-role ROLE-REGULATOR)
+      (and (is-eq user-role ROLE-MANUFACTURER) (is-eq tx-sender (get manufacturer product)))) ERR-NOT-AUTHORIZED)
+    (map-set product-locked product-id true)
+    (ok true)
+  )
+)
+
+(define-public (unlock-product (product-id uint))
+  (let
+    ((product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+     (user-role (default-to u0 (map-get? user-roles tx-sender))))
+    (asserts! (or
+      (is-eq tx-sender (var-get contract-owner))
+      (is-eq user-role ROLE-REGULATOR)
+      (and (is-eq user-role ROLE-MANUFACTURER) (is-eq tx-sender (get manufacturer product)))) ERR-NOT-AUTHORIZED)
+    (map-set product-locked product-id false)
+    (ok true)
+  )
+)
+
+(define-read-only (is-product-locked (product-id uint))
+  (default-to false (map-get? product-locked product-id))
+)
+
 (define-read-only (get-product (product-id uint))
   (map-get? products product-id)
 )
@@ -422,9 +460,11 @@
      (thresholds (unwrap! (map-get? product-temp-thresholds product-id) ERR-TEMP-RANGE-NOT-SET))
      (user-role (default-to u0 (map-get? user-roles tx-sender)))
      (min-temp (get min-temp thresholds))
-     (max-temp (get max-temp thresholds)))
+     (max-temp (get max-temp thresholds))
+     (locked (default-to false (map-get? product-locked product-id))))
     
     (asserts! (>= user-role ROLE-DISTRIBUTOR) ERR-NOT-AUTHORIZED)
+    (asserts! (not locked) ERR-PRODUCT-LOCKED)
     
     (if (and (>= temp min-temp) (<= temp max-temp))
       (begin
