@@ -15,6 +15,12 @@
 (define-constant ERR-TEMP-RANGE-NOT-SET (err u109))
 (define-constant ERR-INVALID-TEMP-RANGE (err u110))
 (define-constant ERR-PRODUCT-LOCKED (err u111))
+(define-constant ERR-INVALID-THRESHOLD (err u112))
+
+(define-constant EXPIRY-STATUS-EXPIRED u1)
+(define-constant EXPIRY-STATUS-CRITICAL u2)
+(define-constant EXPIRY-STATUS-WARNING u3)
+(define-constant EXPIRY-STATUS-SAFE u4)
 
 (define-constant ROLE-MANUFACTURER u1)
 (define-constant ROLE-DISTRIBUTOR u2)
@@ -26,6 +32,8 @@
 (define-data-var product-id-nonce uint u0)
 (define-data-var temp-alert-counter uint u0)
 (define-data-var analytics-enabled bool true)
+(define-data-var expiry-warning-threshold uint u1008)
+(define-data-var expiry-critical-threshold uint u144)
 
 (define-map user-roles principal uint)
 
@@ -128,6 +136,28 @@
     compliant-transfers: uint,
     total-transfers: uint,
     violation-count: uint,
+    last-updated: uint
+  }
+)
+
+(define-map expiry-notifications
+  uint
+  {
+    product-id: uint,
+    notified-at: uint,
+    status: uint,
+    notifier: principal
+  }
+)
+
+(define-map batch-expiry-summary
+  (string-ascii 32)
+  {
+    total-products: uint,
+    expired-count: uint,
+    critical-count: uint,
+    warning-count: uint,
+    safe-count: uint,
     last-updated: uint
   }
 )
@@ -583,6 +613,141 @@
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
     (var-set analytics-enabled (not (var-get analytics-enabled)))
     (ok (var-get analytics-enabled))
+  )
+)
+
+(define-public (set-expiry-thresholds (warning-blocks uint) (critical-blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (> warning-blocks critical-blocks) ERR-INVALID-THRESHOLD)
+    (var-set expiry-warning-threshold warning-blocks)
+    (var-set expiry-critical-threshold critical-blocks)
+    (ok true)
+  )
+)
+
+(define-public (check-product-expiry (product-id uint))
+  (let
+    ((product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+     (expiry-date (get expiry-date product))
+     (blocks-until-expiry (if (> expiry-date stacks-block-height) 
+                             (- expiry-date stacks-block-height) 
+                             u0))
+     (status (get-expiry-status-value expiry-date)))
+    
+    (map-set expiry-notifications product-id {
+      product-id: product-id,
+      notified-at: stacks-block-height,
+      status: status,
+      notifier: tx-sender
+    })
+    
+    (ok {
+      product-id: product-id,
+      expiry-date: expiry-date,
+      blocks-remaining: blocks-until-expiry,
+      status: status,
+      status-label: (get-expiry-label status)
+    })
+  )
+)
+
+(define-public (update-batch-expiry-summary (batch-number (string-ascii 32)) (product-id uint))
+  (let
+    ((product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+     (current-summary (default-to 
+       { total-products: u0, expired-count: u0, critical-count: u0, warning-count: u0, safe-count: u0, last-updated: u0 }
+       (map-get? batch-expiry-summary batch-number)))
+     (status (get-expiry-status-value (get expiry-date product))))
+    
+    (asserts! (is-eq batch-number (get batch-number product)) ERR-PRODUCT-NOT-FOUND)
+    
+    (map-set batch-expiry-summary batch-number {
+      total-products: (+ (get total-products current-summary) u1),
+      expired-count: (+ (get expired-count current-summary) (if (is-eq status EXPIRY-STATUS-EXPIRED) u1 u0)),
+      critical-count: (+ (get critical-count current-summary) (if (is-eq status EXPIRY-STATUS-CRITICAL) u1 u0)),
+      warning-count: (+ (get warning-count current-summary) (if (is-eq status EXPIRY-STATUS-WARNING) u1 u0)),
+      safe-count: (+ (get safe-count current-summary) (if (is-eq status EXPIRY-STATUS-SAFE) u1 u0)),
+      last-updated: stacks-block-height
+    })
+    
+    (ok status)
+  )
+)
+
+(define-private (get-expiry-status-value (expiry-date uint))
+  (if (<= expiry-date stacks-block-height)
+    EXPIRY-STATUS-EXPIRED
+    (if (<= (- expiry-date stacks-block-height) (var-get expiry-critical-threshold))
+      EXPIRY-STATUS-CRITICAL
+      (if (<= (- expiry-date stacks-block-height) (var-get expiry-warning-threshold))
+        EXPIRY-STATUS-WARNING
+        EXPIRY-STATUS-SAFE
+      )
+    )
+  )
+)
+
+(define-private (get-expiry-label (status uint))
+  (if (is-eq status EXPIRY-STATUS-EXPIRED)
+    "EXPIRED"
+    (if (is-eq status EXPIRY-STATUS-CRITICAL)
+      "CRITICAL"
+      (if (is-eq status EXPIRY-STATUS-WARNING)
+        "WARNING"
+        "SAFE"
+      )
+    )
+  )
+)
+
+(define-read-only (get-expiry-thresholds)
+  {
+    warning-threshold: (var-get expiry-warning-threshold),
+    critical-threshold: (var-get expiry-critical-threshold)
+  }
+)
+
+(define-read-only (get-product-expiry-status (product-id uint))
+  (match (map-get? products product-id)
+    product
+    (let
+      ((expiry-date (get expiry-date product))
+       (status (get-expiry-status-value expiry-date)))
+      (ok {
+        product-id: product-id,
+        name: (get name product),
+        batch-number: (get batch-number product),
+        expiry-date: expiry-date,
+        blocks-remaining: (if (> expiry-date stacks-block-height) 
+                            (- expiry-date stacks-block-height) 
+                            u0),
+        status: status,
+        status-label: (get-expiry-label status)
+      })
+    )
+    ERR-PRODUCT-NOT-FOUND
+  )
+)
+
+(define-read-only (get-batch-expiry-summary (batch-number (string-ascii 32)))
+  (map-get? batch-expiry-summary batch-number)
+)
+
+(define-read-only (get-expiry-notification (product-id uint))
+  (map-get? expiry-notifications product-id)
+)
+
+(define-read-only (is-product-near-expiry (product-id uint))
+  (match (map-get? products product-id)
+    product
+    (let
+      ((status (get-expiry-status-value (get expiry-date product))))
+      (or (is-eq status EXPIRY-STATUS-EXPIRED) 
+          (is-eq status EXPIRY-STATUS-CRITICAL)
+          (is-eq status EXPIRY-STATUS-WARNING))
+    )
+    true
   )
 )
 
