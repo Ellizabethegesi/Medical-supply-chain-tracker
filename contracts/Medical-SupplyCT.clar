@@ -16,6 +16,8 @@
 (define-constant ERR-INVALID-TEMP-RANGE (err u110))
 (define-constant ERR-PRODUCT-LOCKED (err u111))
 (define-constant ERR-INVALID-THRESHOLD (err u112))
+(define-constant ERR-INSUFFICIENT-QUANTITY (err u113))
+(define-constant ERR-INVALID-QUANTITY (err u114))
 
 (define-constant EXPIRY-STATUS-EXPIRED u1)
 (define-constant EXPIRY-STATUS-CRITICAL u2)
@@ -161,6 +163,33 @@
     last-updated: uint
   }
 )
+
+(define-map product-inventory
+  uint
+  {
+    total-quantity: uint,
+    available-quantity: uint,
+    reserved-quantity: uint,
+    unit-type: (string-ascii 16),
+    last-updated: uint
+  }
+)
+
+(define-map inventory-by-owner
+  { product-id: uint, owner: principal }
+  uint
+)
+
+(define-map inventory-reservations
+  { product-id: uint, reserver: principal }
+  {
+    quantity: uint,
+    reserved-at: uint,
+    expires-at: uint
+  }
+)
+
+(define-data-var reservation-duration uint u144)
 
 (define-public (set-user-role (user principal) (role uint))
   (begin
@@ -748,6 +777,211 @@
           (is-eq status EXPIRY-STATUS-WARNING))
     )
     true
+  )
+)
+
+(define-public (initialize-inventory 
+  (product-id uint) 
+  (quantity uint) 
+  (unit-type (string-ascii 16)))
+  (let
+    ((product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+     (user-role (default-to u0 (map-get? user-roles tx-sender))))
+    
+    (asserts! (is-eq tx-sender (get manufacturer product)) ERR-NOT-AUTHORIZED)
+    (asserts! (> quantity u0) ERR-INVALID-QUANTITY)
+    
+    (map-set product-inventory product-id {
+      total-quantity: quantity,
+      available-quantity: quantity,
+      reserved-quantity: u0,
+      unit-type: unit-type,
+      last-updated: stacks-block-height
+    })
+    
+    (map-set inventory-by-owner { product-id: product-id, owner: tx-sender } quantity)
+    (ok true)
+  )
+)
+
+(define-public (transfer-quantity
+  (product-id uint)
+  (to principal)
+  (quantity uint)
+  (location (string-ascii 64))
+  (notes (string-ascii 128)))
+  (let
+    ((product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+     (inventory (unwrap! (map-get? product-inventory product-id) ERR-PRODUCT-NOT-FOUND))
+     (sender-qty (default-to u0 (map-get? inventory-by-owner { product-id: product-id, owner: tx-sender })))
+     (recipient-qty (default-to u0 (map-get? inventory-by-owner { product-id: product-id, owner: to })))
+     (user-role (default-to u0 (map-get? user-roles tx-sender)))
+     (recipient-role (default-to u0 (map-get? user-roles to)))
+     (locked (default-to false (map-get? product-locked product-id))))
+    
+    (asserts! (>= user-role ROLE-MANUFACTURER) ERR-NOT-AUTHORIZED)
+    (asserts! (>= recipient-role ROLE-MANUFACTURER) ERR-NOT-AUTHORIZED)
+    (asserts! (not locked) ERR-PRODUCT-LOCKED)
+    (asserts! (> quantity u0) ERR-INVALID-QUANTITY)
+    (asserts! (>= sender-qty quantity) ERR-INSUFFICIENT-QUANTITY)
+    (asserts! (< stacks-block-height (get expiry-date product)) ERR-EXPIRED-PRODUCT)
+    
+    (map-set inventory-by-owner { product-id: product-id, owner: tx-sender } (- sender-qty quantity))
+    (map-set inventory-by-owner { product-id: product-id, owner: to } (+ recipient-qty quantity))
+    
+    (let
+      ((current-sequence (default-to u0 (map-get? product-sequence-counter product-id)))
+       (new-sequence (+ current-sequence u1)))
+      
+      (map-set product-history
+        { product-id: product-id, sequence: new-sequence }
+        {
+          from: tx-sender,
+          to: to,
+          timestamp: stacks-block-height,
+          location: location,
+          temperature: none,
+          notes: notes
+        }
+      )
+      
+      (map-set product-sequence-counter product-id new-sequence)
+      (ok { sequence: new-sequence, quantity-transferred: quantity })
+    )
+  )
+)
+
+(define-public (reserve-inventory (product-id uint) (quantity uint))
+  (let
+    ((inventory (unwrap! (map-get? product-inventory product-id) ERR-PRODUCT-NOT-FOUND))
+     (available (get available-quantity inventory))
+     (reserved (get reserved-quantity inventory))
+     (user-role (default-to u0 (map-get? user-roles tx-sender))))
+    
+    (asserts! (>= user-role ROLE-DISTRIBUTOR) ERR-NOT-AUTHORIZED)
+    (asserts! (> quantity u0) ERR-INVALID-QUANTITY)
+    (asserts! (>= available quantity) ERR-INSUFFICIENT-QUANTITY)
+    
+    (map-set product-inventory product-id (merge inventory {
+      available-quantity: (- available quantity),
+      reserved-quantity: (+ reserved quantity),
+      last-updated: stacks-block-height
+    }))
+    
+    (map-set inventory-reservations { product-id: product-id, reserver: tx-sender } {
+      quantity: quantity,
+      reserved-at: stacks-block-height,
+      expires-at: (+ stacks-block-height (var-get reservation-duration))
+    })
+    
+    (ok true)
+  )
+)
+
+(define-public (release-reservation (product-id uint))
+  (let
+    ((inventory (unwrap! (map-get? product-inventory product-id) ERR-PRODUCT-NOT-FOUND))
+     (reservation (unwrap! (map-get? inventory-reservations { product-id: product-id, reserver: tx-sender }) ERR-PRODUCT-NOT-FOUND))
+     (reserved-qty (get quantity reservation))
+     (available (get available-quantity inventory))
+     (total-reserved (get reserved-quantity inventory)))
+    
+    (map-set product-inventory product-id (merge inventory {
+      available-quantity: (+ available reserved-qty),
+      reserved-quantity: (- total-reserved reserved-qty),
+      last-updated: stacks-block-height
+    }))
+    
+    (map-delete inventory-reservations { product-id: product-id, reserver: tx-sender })
+    (ok reserved-qty)
+  )
+)
+
+(define-public (adjust-inventory (product-id uint) (new-quantity uint) (reason (string-ascii 128)))
+  (let
+    ((product (unwrap! (map-get? products product-id) ERR-PRODUCT-NOT-FOUND))
+     (inventory (unwrap! (map-get? product-inventory product-id) ERR-PRODUCT-NOT-FOUND))
+     (user-role (default-to u0 (map-get? user-roles tx-sender)))
+     (current-total (get total-quantity inventory))
+     (current-available (get available-quantity inventory))
+     (current-reserved (get reserved-quantity inventory)))
+    
+    (asserts! (or
+      (is-eq tx-sender (get manufacturer product))
+      (is-eq user-role ROLE-REGULATOR)) ERR-NOT-AUTHORIZED)
+    (asserts! (>= new-quantity current-reserved) ERR-INSUFFICIENT-QUANTITY)
+    
+    (let
+      ((current-sequence (default-to u0 (map-get? product-sequence-counter product-id)))
+       (new-sequence (+ current-sequence u1)))
+      
+      (map-set product-inventory product-id {
+        total-quantity: new-quantity,
+        available-quantity: (- new-quantity current-reserved),
+        reserved-quantity: current-reserved,
+        unit-type: (get unit-type inventory),
+        last-updated: stacks-block-height
+      })
+      
+      (map-set product-history
+        { product-id: product-id, sequence: new-sequence }
+        {
+          from: tx-sender,
+          to: tx-sender,
+          timestamp: stacks-block-height,
+          location: "INVENTORY-ADJUSTMENT",
+          temperature: none,
+          notes: reason
+        }
+      )
+      
+      (map-set product-sequence-counter product-id new-sequence)
+      (ok { old-quantity: current-total, new-quantity: new-quantity })
+    )
+  )
+)
+
+(define-public (set-reservation-duration (blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+    (asserts! (> blocks u0) ERR-INVALID-QUANTITY)
+    (var-set reservation-duration blocks)
+    (ok true)
+  )
+)
+
+(define-read-only (get-product-inventory (product-id uint))
+  (map-get? product-inventory product-id)
+)
+
+(define-read-only (get-owner-quantity (product-id uint) (owner principal))
+  (default-to u0 (map-get? inventory-by-owner { product-id: product-id, owner: owner }))
+)
+
+(define-read-only (get-reservation (product-id uint) (reserver principal))
+  (map-get? inventory-reservations { product-id: product-id, reserver: reserver })
+)
+
+(define-read-only (is-reservation-expired (product-id uint) (reserver principal))
+  (match (map-get? inventory-reservations { product-id: product-id, reserver: reserver })
+    reservation (>= stacks-block-height (get expires-at reservation))
+    true
+  )
+)
+
+(define-read-only (get-inventory-summary (product-id uint))
+  (match (map-get? product-inventory product-id)
+    inventory
+    (ok {
+      total: (get total-quantity inventory),
+      available: (get available-quantity inventory),
+      reserved: (get reserved-quantity inventory),
+      unit: (get unit-type inventory),
+      utilization-rate: (if (> (get total-quantity inventory) u0)
+        (/ (* (- (get total-quantity inventory) (get available-quantity inventory)) u100) (get total-quantity inventory))
+        u0)
+    })
+    ERR-PRODUCT-NOT-FOUND
   )
 )
 
